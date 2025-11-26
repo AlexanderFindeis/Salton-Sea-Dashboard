@@ -1,0 +1,649 @@
+---
+title: "Salton Sea Dashboard"
+---
+# Overview
+
+## Salton Sea Storage Over Time {width=50%}
+```{r, include=FALSE, echo=FALSE}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr, htmltools, htmlwidgets, stringr, dataRetrieval, sf, geojsonsf, zoo, DT, ggplot2, plotly, crosstalk, stats, forecast, leaflet, jsonlite)
+
+gpk <- st_read("Salton Sea Project Data.gpkg", layer="Contour Polygons Mean")
+
+# Convert geopackage layer into a dataframe
+Depth.Data <- tibble(gpk) %>%
+  select(-7) # Remove geometry column
+
+# Create list of elevation range for looping through data
+elv.range <- seq(-221, -280, by = -1)
+
+# Create empty data frame that data can be unioned to
+Union.Calc <- data.frame(Elevation = integer(),
+                         Cuft = integer(),
+                         Surface.Area.Sqft = double(),
+                         Acres = double())
+
+for (i in elv.range) {
+  
+  print(i)
+  
+  instance.calc <- Depth.Data %>%
+    filter(Contour_max <= i) %>% # Using Contour_max to get the outer boundary of the polygon
+    mutate(Depth = Contour.Feet.Mean - i) %>% # Derive depth of the lake by subtracting the elevation of the surface from the lake bed
+    mutate(Cuft = (Depth * -1) * Area.Square.Ft) %>%
+    mutate(Elevation = i) %>%
+    group_by(Elevation) %>%
+    summarize(Cuft = sum(Cuft),
+              Surface.Area.Sqft = sum(Area.Square.Ft))
+  
+  Union.Calc <- bind_rows(Union.Calc, instance.calc) %>%
+    mutate(Acre.Feet = Cuft / 43560) %>%
+    mutate(Acres = Surface.Area.Sqft / 43560)
+}
+
+
+## Interpolate data to get linear interpolation of lake storage at tenth-foot fractions of a foot contour
+# Generate new Elevation values with one-tenth increments
+elevation_seq <- seq(min(Union.Calc$Elevation), max(Union.Calc$Elevation), by = 0.1)
+# Interpolate Acre.Feet for new elevation values
+Interpolated.Data <- data.frame(
+  Elevation = elevation_seq) %>%
+  mutate(Acre.Feet = approx(Union.Calc$Elevation, Union.Calc$Acre.Feet, xout = Elevation)$y) %>%
+  arrange(Elevation) %>%
+  mutate(Per.Storage.Change = (Acre.Feet/lag(Acre.Feet) - 1) * 100) # Percent change in storage volume to the next lowest elevation value (E.g. -277.7 changes by 50% from -277.8)
+
+# Retrieve historical elevation data of the Salton Sea
+Salton.Sea.Elv <- readNWISdv(siteNumbers = "10254005", # Salton Sea elevation monitoring site
+                     parameterCd = "62614",
+                     startDate = "1987-10-01",
+                     endDate = "2024-09-01") %>%
+  rename("Elv" = 4) %>%
+  select(Date, Elv) %>%
+  mutate(across(c('Elv'), round, 1)) # Rounds to only one decimal place. Ensures data is joined correctly
+
+# Join Elevation and Storage estimation data
+Storage.Model <- Salton.Sea.Elv %>%
+  left_join(Interpolated.Data, by = c("Elv" = "Elevation")) %>%
+  mutate(Acre.Feet.Mil = Acre.Feet / 1000000) %>%
+  mutate(One.Month.Avg = zoo::rollmean(Acre.Feet.Mil, 30, fill = NA)) %>% # 30 day rolling average instead of extracting months and averaging manually, which would disrupt the date field
+  mutate(One.Year.Avg = zoo::rollmean(Acre.Feet.Mil, 365, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+
+# Storage over time
+Storage.Plot <- ggplot(Storage.Model) + 
+  geom_line(aes(x = Date, y = One.Month.Avg), color = "darkred") + 
+  geom_line(aes(x = Date, y = One.Year.Avg), color="steelblue", linetype="twodash") +
+  scale_y_continuous(
+    name = "Millions of Acre-Feet") +
+  labs() +
+  theme_minimal()
+```
+
+```{r}
+#| title: Salton Sea Storage in Millions of Acre-Feet
+
+ggplotly(Storage.Plot)
+```
+
+
+## Charts {width=50%}
+
+### Inflows {.tabset}
+```{r, include=FALSE}
+Salton_1 <- readNWISdv(siteNumbers = "10255550", # New River
+                      parameterCd = "00060", # Average discharge cubic feet per second
+                      startDate = "1980-01-01",
+                      endDate = "2023-12-31") %>%
+  rename("Discharge" = 4) %>%
+  mutate(TotalDailyDischarge = Discharge * 60 * 60 * 24) %>% # Cubic feet per second -> Cubic Feet Per Day
+  mutate(Year = substr(Date,0,4)) %>% # Extract Year from Date
+  mutate(Year = as.integer(Year)) %>% # Convert text year into integer year
+  group_by(Year) %>%
+  summarize(AnnualInflow = sum(TotalDailyDischarge, na.rm=T), # In cubic feet
+            AverageCUFT2 = mean(Discharge, na.rm=T)) %>% # In cubic feet per second 
+  mutate(AnnualInflowAF = AnnualInflow / 43560) %>%
+  mutate(AF_Millions = AnnualInflowAF / 1000000) %>%
+  mutate(Five.Year.Average = zoo::rollmean(AnnualInflowAF, k = 5, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 0))
+
+New.River.Graph <- ggplot(Salton_1, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") + 
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+
+Salton_2 <- readNWISdv(siteNumbers = "10254730", # Alamo River
+                      parameterCd = "00060",
+                      startDate = "1980-01-01",
+                      endDate = "2023-12-31") %>%
+  rename("Discharge" = 4) %>%
+  mutate(TotalDailyDischarge = Discharge * 60 * 60 * 24) %>% # Cubic feet per second -> Cubic Feet Per Day
+  mutate(Year = substr(Date,0,4)) %>% # Extract Year from Date
+  mutate(Year = as.integer(Year)) %>% # Convert text year into integer year
+  group_by(Year) %>%
+  summarize(AnnualInflow = sum(TotalDailyDischarge, na.rm=T), # In cubic feet
+            AverageCUFT2 = mean(Discharge, na.rm=T)) %>% # In cubic feet per second 
+  mutate(AnnualInflowAF = AnnualInflow / 43560) %>%
+  mutate(AF_Millions = AnnualInflowAF / 1000000) %>%
+  mutate(Five.Year.Average = zoo::rollmean(AnnualInflowAF, k = 5, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 0))
+
+Alamo.River.Graph <- ggplot(Salton_2, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") + 
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+
+Salton_3 <- readNWISdv(siteNumbers = "10254050", # Salt Creek
+                      parameterCd = "00060",
+                      startDate = "1980-01-01",
+                      endDate = "2023-12-31") %>%
+  rename("Discharge" = 4) %>%
+  mutate(TotalDailyDischarge = Discharge * 60 * 60 * 24) %>% # Cubic feet per second -> Cubic Feet Per Day
+  mutate(Year = substr(Date,0,4)) %>% # Extract Year from Date
+  mutate(Year = as.integer(Year)) %>% # Convert text year into integer year
+  group_by(Year) %>%
+  summarize(AnnualInflow = sum(TotalDailyDischarge, na.rm=T), # In cubic feet
+            AverageCUFT2 = mean(Discharge, na.rm=T)) %>% # In cubic feet per second 
+  mutate(AnnualInflowAF = AnnualInflow / 43560) %>%
+  mutate(AF_Millions = AnnualInflowAF / 1000000) %>%
+  mutate(Five.Year.Average = zoo::rollmean(AnnualInflowAF, k = 5, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 0))
+
+Salt.Creek.Graph <- ggplot(Salton_3, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") + 
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+
+Salton_4 <- readNWISdv(siteNumbers = "10259540", # Coachella
+                      parameterCd = "00060",
+                      startDate = "1980-01-01",
+                      endDate = "2023-12-31") %>%
+  rename("Discharge" = 4) %>%
+  mutate(TotalDailyDischarge = Discharge * 60 * 60 * 24) %>% # Cubic feet per second -> Cubic Feet Per Day
+  mutate(Year = substr(Date,0,4)) %>% # Extract Year from Date
+  mutate(Year = as.integer(Year)) %>% # Convert text year into integer year
+  group_by(Year) %>%
+  summarize(AnnualInflow = sum(TotalDailyDischarge, na.rm=T), # In cubic feet
+            AverageCUFT2 = mean(Discharge, na.rm=T)) %>% # In cubic feet per second 
+  mutate(AnnualInflowAF = AnnualInflow / 43560) %>%
+  mutate(AF_Millions = AnnualInflowAF / 1000000) %>%
+  mutate(Five.Year.Average = zoo::rollmean(AnnualInflowAF, k = 5, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 0))
+
+Whiteriver.Graph <- ggplot(Salton_4, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") + 
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+New_River_Border <- readNWISdv(siteNumbers = "10254970", # New River at Mexican border
+                               parameterCd = "00060",
+                               startDate = "1980-01-01",
+                               endDate = "2023-12-31") %>%
+  rename("Discharge" = 4) %>%
+  mutate(TotalDailyDischarge = Discharge * 60 * 60 * 24) %>% # Cubic feet per second -> Cubic Feet Per Day
+  mutate(Year = substr(Date,0,4)) %>% # Extract Year from Date
+  mutate(Year = as.integer(Year)) %>% # Convert text year into integer year
+  group_by(Year) %>%
+  summarize(AnnualInflow = sum(TotalDailyDischarge, na.rm=T), # In cubic feet
+            AverageCUFT2 = mean(Discharge, na.rm=T)) %>% # In cubic feet per second 
+  mutate(AnnualInflowAF = AnnualInflow / 43560) %>%
+  mutate(AF_Millions = AnnualInflowAF / 1000000) %>%
+  mutate(Five.Year.Average = zoo::rollmean(AnnualInflowAF, k = 5, fill = NA)) %>%
+  mutate(across(where(is.numeric), round, 0))
+
+New_River_Border.Graph <- ggplot(New_River_Border, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") + 
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+
+Total_Inflows <- Salton_1 %>%
+  rbind(Salton_2) %>%
+  rbind(Salton_3) %>% 
+  rbind(Salton_4) %>%
+  rbind(New_River_Border) %>%
+  # Sum all fields grouped by year
+  group_by(Year) %>%
+  summarize(AnnualInflowAF = sum(AnnualInflowAF),
+            AF_Millions = sum(AF_Millions),
+            Five.Year.Average = sum(Five.Year.Average))
+
+Total_Inflows.Graph <- ggplot(Total_Inflows, aes(x=Year, group=1)) + 
+  geom_line(aes(y = AnnualInflowAF), color = "darkred") +
+  geom_line(aes(y = Five.Year.Average), color="steelblue", linetype="twodash") +
+  labs(title = "Salton Sea Total Inflows in Acre-Feet",
+           x = "Date",
+           y = "Acre-Feet") +
+      theme_minimal()
+
+```
+
+```{r}
+#| title: Total Inflows
+ggplotly(Total_Inflows.Graph)
+```
+```{r}
+#| title: New River
+ggplotly(New.River.Graph)
+```
+```{r}
+#| title: Alamo River
+ggplotly(Alamo.River.Graph)
+```
+```{r}
+#| title: Salt Creek
+ggplotly(Salt.Creek.Graph)
+```
+```{r}
+#| title: Whiteriver
+ggplotly(Whiteriver.Graph)
+```
+```{r}
+#| title: New River at the Mexican Border
+ggplotly(New_River_Border.Graph) 
+```
+
+
+### Elevation Projection
+```{r, include = FALSE}
+Salton <- readNWISdv(siteNumbers = "10254005", # Salton Sea elevation monitoring site
+                     parameterCd = "62614",
+                     startDate = "1987-10-01",
+                     endDate = "2024-09-01") %>%
+  rename("Elv" = 4) %>%
+  select(Date, Elv)
+
+Salton_month <- Salton %>%
+  mutate(Year = substr(Date,0,4)) %>%
+  mutate(Year = as.integer(Year)) %>%
+  mutate(Month = substr(Date,6,7)) %>%
+  mutate(Month = as.integer(Month)) %>%
+  group_by(Year, Month) %>%
+  summarize(Elv = mean(Elv)) %>%
+  ungroup() %>%
+  select(Elv) # Drop dates for time series conversion
+
+Salton_Hist <- Salton %>%
+  mutate(Day = substr(Date, 9, 10)) %>%
+  filter(Day == "01") %>% # Using first of each month to match time series projection
+  select(-Day) %>%
+  mutate(Upper = NA) %>% # Create null fields to allow for union with projection data
+  mutate(Lower = NA) %>%
+  rename(Elevation = Elv) %>%
+  mutate(Group = "History")
+
+Salton_ts <- ts(Salton_month, start = c(1987, 10), end = c(2023, 9), frequency = 12)
+Model <- auto.arima(Salton_ts)# [,1])
+Forecast <- forecast(Model,level=c(95), h=30*12) # Projecting 30 years into the future
+plot(Forecast)
+
+Projection_mean <- Forecast$mean
+Projection_mean <- data.frame(Elevation=as.matrix(Projection_mean), Date=as.Date(as.yearmon(time(Projection_mean)))) %>%
+  mutate(Group = "Projection")
+
+Projection_upper <- Forecast$upper
+Projection_upper <- data.frame(Elevation=as.matrix(Projection_upper), Date=as.Date(as.yearmon(time(Projection_upper)))) %>%
+  rename(Upper = 1) %>%
+  mutate(Group = "Projection")
+
+Projection_lower <- Forecast$lower
+Projection_lower <- data.frame(Elevation=as.matrix(Projection_lower), Date=as.Date(as.yearmon(time(Projection_lower)))) %>%
+  rename(Lower = 1) %>%
+  mutate(Group = "Projection")
+
+Projection <- Projection_mean %>%
+  left_join(Projection_upper, by = c("Date", "Group")) %>%
+  left_join(Projection_lower, by = c("Date", "Group")) %>%
+  union(Salton_Hist) %>%
+  mutate(across(where(is.numeric), round, 1))
+
+Projection_Plot <- ggplot(Projection, aes(x=Date, y=Elevation)) +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper), fill = "blue", alpha = 0.2) +
+  geom_line(aes(y = Elevation, color = Group), size = 1) +
+  scale_color_manual(values = c("Projection" = "blue", "History" = "black")) +
+  labs(title = "Projected Decline in Salton Sea Elevation",
+       x = "Date",
+       y = "Elevation (ft)") +
+  theme_minimal()
+```
+```{r}
+ggplotly(Projection_Plot)
+```
+
+
+
+# Elevation Projection: Interactive Chart and Map
+## Graph and Slider
+```{r, include=FALSE}
+# ojs_define(projection_ojs = Projection)
+Projection_Export <- Projection %>%
+  left_join(Union.Calc, by = "Elevation") %>%
+  select(-Cuft, -Surface.Area.Sqft)
+write.csv(Projection_Export, "Projection.csv")
+```
+
+### Slider and Plotly Chart
+```{ojs}
+//html`<div id="slider" style="height: 100px, width: 500px;"></div>`
+
+viewof elevation_slider = Inputs.range(
+  [-221, -277],
+  {value: -241, step: 1, label: "Elevation"}
+)
+
+// button to reset slider, tied to function to trigger event
+viewof reset_elev = Inputs.button("Reset Elevation Slider");
+
+html`<div id="salton-chart" style="width: 100%; min-height: 750px;"></div>`
+
+projection_ojs = (await FileAttachment("Projection.csv").csv()).map(d => ({
+  ...d,
+  Date: new Date(d.Date),
+  Elevation: +d.Elevation,
+  Lower: +d.Lower,
+  Upper: +d.Upper,
+  Group: d.Group
+}))
+.sort((a, b) => a.Date - b.Date)
+
+filtered_nearest = (() => {
+  if (elevation_slider === null) return projection_ojs;
+  const target = Number(elevation_slider);
+  let best = null;
+  let bestDiff = Infinity;
+  for (const d of projection_ojs) {
+    const diff = Math.abs(Number(d.Elevation) - target);
+    if (diff < bestDiff) { bestDiff = diff; best = d; }
+  }
+  return best ? [best] : [];
+})()
+
+graph = Plotly.newPlot("salton-chart", [
+  // Ribbon (uncertainty bounds)
+  {
+    x: projection_ojs.map(d => d.Date).concat(projection_ojs.map(d => d.Date).reverse()),
+    y: projection_ojs.map(d => d.Upper).concat(projection_ojs.map(d => d.Lower).reverse()),
+    fill: "toself",
+    fillcolor: "rgba(0, 0, 255, 0.2)",
+    line: { color: "transparent" },
+    type: "scatter",
+    mode: "lines",
+    name: "Uncertainty Range",
+    showlegend: true
+  },
+
+  // Line: Projection group
+  {
+    x: projection_ojs.filter(d => d.Group === "Projection").map(d => d.Date),
+    y: projection_ojs.filter(d => d.Group === "Projection").map(d => d.Elevation),
+    type: "scatter",
+    mode: "lines",
+    name: "Projection",
+    line: { color: "blue", width: 2 }
+  },
+
+  // Line: History group
+  {
+    x: projection_ojs.filter(d => d.Group === "History").map(d => d.Date),
+    y: projection_ojs.filter(d => d.Group === "History").map(d => d.Elevation),
+    type: "scatter",
+    mode: "lines",
+    name: "History",
+    line: { color: "black", width: 2 }
+  },
+  
+  // Marker: Highlight
+  {
+    x: filtered_nearest.map(d => d.Date),
+    y: filtered_nearest.map(d => d.Elevation),
+    type: "scatter",
+    mode: "markers",
+    name: "Selected Elevation",
+    marker: {
+      color: 'rgb(199,16,16)',
+      size: 10,
+      line: {
+        color: 'rgb(255,0,0)',
+      width: 1
+    }
+  }
+}
+], {
+  title: "Projected Decline in Salton Sea Elevation",
+  xaxis: { title: "Date", type: "date", range: ["1987-01-01", "2055-12-31"] },
+  yaxis: { title: "Elevation (ft)", range: [-280, -220] },
+  font: { family: "sans-serif" },
+  plot_bgcolor: "white",
+  paper_bgcolor: "white",
+  legend: { 
+    showlegend: true,
+      x: 1,
+      xanchor: 'right',
+      y: 1
+  }
+ }
+)
+```
+
+## Map D3
+```{r, include=FALSE}
+Contours <- st_read("Salton Sea Project Data.gpkg", layer="Salton Sea 1ft Contours")
+Contours <- st_transform(Contours, crs = 4326) %>%
+  left_join(Union.Calc, by = c("Contour" = "Elevation")) %>%
+  rename("Acre_Feet" = "Acre.Feet") %>%
+  mutate(across(where(is.numeric), round, 0)) #%>%
+  #mutate(popup_content = paste0("Elevation (ft): ", Contour, "<br/>",
+  #                    "Storage (AF): ", Acre.Feet))
+
+st_write(Contours, "Salton_Sea_Contours.geojson", delete_dsn = TRUE)
+
+#geojson_layer <- sf_geojson(Contours)
+#geojson_string <- toJSON(fromJSON(geojson_layer), auto_unbox = TRUE)
+#ojs_define(geo_ojs = geojson_string)
+```
+```{ojs}
+// Cell 1: Create the map container and initialize
+geojsonData = await FileAttachment("Salton_Sea_Contours.geojson").json()
+
+d3 = require("d3@7")
+d3tile = require("d3-tile@1")
+
+map = {
+  const width = 800;
+  const height = 800;
+  
+  const svg = d3.create("svg")
+    .attr("width", width)
+    .attr("height", height)
+    .attr("viewBox", [0, 0, width, height]);
+
+  const projection = d3.geoMercator()
+    .fitSize([width, height], geojsonData);
+
+  const path = d3.geoPath(projection);
+
+  // Tile generator
+  const tile = d3tile.tile()
+    .size([width, height])
+    .scale(projection.scale() * 2 * Math.PI)
+    .translate(projection([0, 0]));
+
+  const tiles = tile();
+
+  const tileGroup = svg.append("g")
+    .attr("class", "tiles");
+
+  tileGroup.selectAll("image")
+    .data(tiles)
+    .join("image")
+    .attr("xlink:href", d =>
+      `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${d[2]}/${d[1]}/${d[0]}`
+    )
+    .attr("x", d => (d[0] + tiles.translate[0]) * tiles.scale)
+    .attr("y", d => (d[1] + tiles.translate[1]) * tiles.scale)
+    .attr("width", tiles.scale)
+    .attr("height", tiles.scale);
+
+  const contourGroup = svg.append("g")
+    .attr("class", "contours");
+
+  // Keep track of the elevation currently highlighted by the slider, set to null first, updates with slider function
+  let currentElev = null;
+
+  // Create an HTML tooltip (one per map)
+  const tooltip = d3.select(document.body).append("div")
+  .attr("class", "map-tooltip")
+  .style("position", "absolute")
+  .style("pointer-events", "none")
+  .style("padding", "4px 8px")
+  .style("background", "rgba(0,0,0,0.7)")
+  .style("color", "white")
+  .style("border-radius", "4px")
+  .style("font-size", "12px")
+  .style("z-index", "10");
+
+  // Draw contours once
+  const contours = contourGroup.selectAll("path")
+    .data(geojsonData.features)
+    .join("path")
+    .attr("d", path)
+    .attr("fill", "none")
+    .on("mouseover", (event, d) => {
+    // Highlight hovered feature
+    d3.select(event.currentTarget)
+    .attr("stroke", "#ffc505ff") // hover color (distinct from slider highlight)
+    .attr("stroke-width", 4);
+
+      // Show tooltip
+      tooltip
+        .style("visibility", "visible")
+        .html(`Elevation: ${d.properties.Contour} ft <br/> 
+              Volume Remaining (AF): ${d.properties.Acre_Feet}`);
+        //.text(d.properties.popup_content || `Elevation: ${d.properties.Contour}`);
+    })
+    .on("mousemove", (event, d) => {
+      // Move tooltip with the mouse
+      tooltip
+        .style("left", (event.pageX + 10) + "px")
+        .style("top", (event.pageY + 10) + "px");
+    })
+    .on("mouseout", (event, d) => {
+      // Hide tooltip
+      tooltip.style("visibility", "hidden");
+      // Restore styling based on the current slider elevation
+      update(currentElev);
+    });
+
+  // Add titles without breaking the selection - similar to tooltip
+  //contours.append("title")
+  //  .text(d => d.properties.popup_content || `Elevation: ${d.properties.Contour}`);
+
+  // --- update function: ONLY changes styling ---
+function update(elev) {
+  currentElev = elev;
+
+  contourGroup.selectAll("path")
+    .attr("stroke", d => {
+      const v = Number(d.properties.Contour);
+      const e = Number(elev);
+
+      if (v === e) {
+        // exact match: highlighted
+        return "#F54927";
+      } else if (v < e) {
+        // below slider: lighter color
+        return "yellow";
+      } else {
+        // above slider: maybe a neutral color
+        return "yellow";
+      }
+    })
+    .attr("stroke-width", d => {
+      const v = Number(d.properties.Contour);
+      const e = Number(elev);
+
+      if (v === e) {
+        // bold line on current elevation
+        return 5;
+      } else if (v > e) {
+        // smaller for contours below slider
+        return 0.5;
+      } else {
+        // default for above
+        return 1;
+      }
+    })
+    .attr("stroke-opacity", d => {
+      const v = Number(d.properties.Contour);
+      const e = Number(elev);
+
+      if (v === e) {
+        return 1;      // fully opaque
+      } else if (v > e) {
+        return 0.3;    // more transparent below
+      } else {
+        return 0.5;    // medium opacity above
+      }
+    });
+}
+
+
+  // initial style (use current slider value if you want)
+  update(null);
+
+  // Zoom behavior
+  svg.call(d3.zoom()
+    .scaleExtent([1, 8])
+    .on("zoom", (event) => {
+      const transform = event.transform;
+      contourGroup.attr("transform", transform);
+      tileGroup.attr("transform", transform);
+    })
+  );
+
+  // expose update so other cells can call it
+  const node = svg.node();
+  node.update = update;
+  return node;
+}
+```
+
+```{ojs}
+//| output: FALSE
+// Triggers map update on slider change, running outside main chunk prevents map from re-rendering
+{
+  map.update(elevation_slider);
+}
+```
+
+```{ojs}
+//| output: FALSE
+// function to reset slider value when button is clicked
+{
+// This cell re-runs every time the button is clicked
+reset_elev;
+const el = viewof elevation_slider; // the actual element
+// Set slider back to default
+el.value = -241;
+// Tell Observable "the input changed" so all dependent cells update
+el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+}
+```

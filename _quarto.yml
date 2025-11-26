@@ -1,0 +1,8 @@
+project:
+  type: website        # website-style project
+  output-dir: _site    # built site lives here
+
+format:
+  dashboard:           # <- use dashboard as the format
+    theme: default
+    orientation: columns
